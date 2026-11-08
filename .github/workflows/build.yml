@@ -14,10 +14,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Create config_generator.cpp
+      - name: Create source files
         run: |
-          mkdir -p src
-          cat > src/config_generator.cpp <<'EOF'
+          mkdir -p src/mod config
+          cat > src/config_generator.cpp <<'SRCEOF'
           #include "mod/Config.h"
 
           #include <filesystem>
@@ -33,11 +33,13 @@ jobs:
                   std::cerr << "Failed to create " << path.parent_path() << ": " << ec.message() << '\n';
                   return false;
               }
+
               std::ofstream stream(path, std::ios::binary | std::ios::trunc);
               if (!stream) {
                   std::cerr << "Failed to open " << path << '\n';
                   return false;
               }
+
               stream << value.dump(2) << '\n';
               return stream.good();
           }
@@ -49,14 +51,266 @@ jobs:
                   std::cerr << "Usage: levi_config_generator <output-config-dir>\n";
                   return 2;
               }
+
               const std::filesystem::path outputDir = argv[1];
               if (!writeJson(outputDir / "config.json", clange_me::makeDefaultConfigJson()))
                   return 1;
               if (!writeJson(outputDir / "config.schema.json", clange_me::makeConfigSchemaJson()))
                   return 1;
+
               return 0;
           }
-          EOF
+          SRCEOF
+          cat > src/main.cpp <<'SRCEOF'
+          #include "mod/MyMod.h"
+
+          #include <pl/Mod.hpp>
+
+          PL_REGISTER_MOD(clange_me::ClangeMeMod, clange_me::ClangeMeMod::instance());
+          SRCEOF
+          cat > src/mod/Config.h <<'SRCEOF'
+          #pragma once
+
+          #include <string>
+          #include <string_view>
+
+          #include <pl/Config.hpp>
+
+          namespace clange_me {
+
+          // Settings loosely mirror the Java BetterHitreg mod (sound muffle/sharpen, toggles).
+          struct ModConfig {
+              int version = 1;
+              bool enabled = true;
+              bool hitSound = true;
+              int muffleAmount = 0;   // 0-100
+              int sharpenAmount = 0;  // 0-100
+              // Where to find GameMode::attack in libminecraftpe.so (1.26.62).
+              // Fill ONE of these. Signature = byte pattern with ?? wildcards.
+              // Rva = hex offset from the module base, e.g. "0x1234567".
+              std::string attackSignature = "";
+              std::string attackRva = "";
+          };
+
+          nlohmann::json makeDefaultConfigJson();
+          nlohmann::json makeConfigSchemaJson();
+
+          } // namespace clange_me
+
+          template <> struct pl::config::Schema<clange_me::ModConfig> {
+              static constexpr std::string_view title = "Better Hitreg Config";
+              static constexpr std::string_view description = {};
+
+              static constexpr FieldSchema field(std::string_view name) {
+                  if (name == "version")
+                      return {.title = "Version", .readOnly = true};
+                  if (name == "enabled")
+                      return {.title = "Enabled", .description = "Turns the mod on or off."};
+                  if (name == "hitSound")
+                      return {.title = "Instant hit sound", .description = "Play hit feedback immediately on swing."};
+                  if (name == "muffleAmount")
+                      return {.title = "Muffle amount", .description = "0-100."};
+                  if (name == "sharpenAmount")
+                      return {.title = "Sharpen amount", .description = "0-100."};
+                  if (name == "attackSignature")
+                      return {.title = "Attack signature", .description = "Byte pattern for the attack function."};
+                  if (name == "attackRva")
+                      return {.title = "Attack RVA", .description = "Hex offset of the attack function, e.g. 0x1234567."};
+                  return {};
+              }
+          };
+          SRCEOF
+          cat > src/mod/Config.cpp <<'SRCEOF'
+          #include "mod/Config.h"
+
+          namespace clange_me {
+
+          nlohmann::json makeDefaultConfigJson() { return pl::config::defaultJson(ModConfig{}); }
+
+          nlohmann::json makeConfigSchemaJson() { return pl::config::schema(ModConfig{}); }
+
+          } // namespace clange_me
+          SRCEOF
+          cat > src/mod/MyMod.h <<'SRCEOF'
+          #pragma once
+
+          #include <optional>
+
+          #include "mod/Config.h"
+
+          #include <pl/Mod.hpp>
+          #include <pl/memory/Hook.hpp>
+
+          namespace clange_me {
+
+          class ClangeMeMod {
+            public:
+              static ClangeMeMod &instance();
+
+              ClangeMeMod();
+
+              [[nodiscard]] ll::mod::NativeMod &getSelf() const { return mSelf; }
+
+              bool load();
+              bool enable();
+              bool disable();
+              bool unload();
+
+              [[nodiscard]] const ModConfig &config() const { return mConfig; }
+              void *original() const { return mOriginalAttack; }
+
+            private:
+              uintptr_t resolveAttackTarget();
+
+              void *mOriginalAttack{};
+              pl::memory::HookHandle mAttackHook;
+              ll::mod::NativeMod &mSelf;
+              ModConfig mConfig;
+              std::optional<pl::config::ConfigFile<ModConfig>> mConfigFile;
+          };
+
+          } // namespace clange_me
+          SRCEOF
+          cat > src/mod/MyMod.cpp <<'SRCEOF'
+          #include "mod/MyMod.h"
+
+          #include <filesystem>
+
+          #include <link.h>
+
+          #include <pl/memory/Signature.hpp>
+
+          #include <pl/Mod.hpp>
+
+          namespace clange_me {
+
+          namespace {
+
+          // ASSUMPTION: GameMode::attack(this, Actor&) -> bool. Verify against 1.26.62
+          // before trusting it; the detour must match the real signature exactly.
+          using AttackFn = bool (*)(void *self, void *actor);
+
+          uintptr_t moduleBase(const char *name) {
+              struct Ctx { const char *name; uintptr_t base; } ctx{name, 0};
+              dl_iterate_phdr(
+                  [](dl_phdr_info *info, size_t, void *data) -> int {
+                      auto *c = static_cast<Ctx *>(data);
+                      if (info->dlpi_name && std::string_view(info->dlpi_name).find(c->name) != std::string_view::npos) {
+                          c->base = info->dlpi_addr;
+                          return 1;
+                      }
+                      return 0;
+                  },
+                  &ctx);
+              return ctx.base;
+          }
+
+          bool attackDetour(void *self, void *actor) {
+              auto &mod = ClangeMeMod::instance();
+              // Instant client-side feedback (sound / effects) goes here once the
+              // matching game functions are located. For now this just passes through.
+              return reinterpret_cast<AttackFn>(mod.original())(self, actor);
+          }
+
+          } // namespace
+
+          uintptr_t ClangeMeMod::resolveAttackTarget() {
+              auto &log = getSelf().getLogger();
+              if (!mConfig.attackSignature.empty()) {
+                  uintptr_t addr = pl::memory::resolveSignature(mConfig.attackSignature, "libminecraftpe.so");
+                  if (addr == 0)
+                      log.warn("attackSignature did not match in libminecraftpe.so");
+                  return addr;
+              }
+              if (!mConfig.attackRva.empty()) {
+                  uintptr_t base = moduleBase("libminecraftpe.so");
+                  if (base == 0) {
+                      log.warn("Could not find libminecraftpe.so base address");
+                      return 0;
+                  }
+                  return base + static_cast<uintptr_t>(std::stoull(mConfig.attackRva, nullptr, 16));
+              }
+              return 0;
+          }
+
+          ClangeMeMod &ClangeMeMod::instance() {
+              static ClangeMeMod instance;
+              return instance;
+          }
+
+          ClangeMeMod::ClangeMeMod() : mSelf(*ll::mod::NativeMod::current()) {}
+
+          bool ClangeMeMod::load() {
+              auto &self = getSelf();
+              self.getLogger().debug("Loading...");
+
+              std::error_code ec;
+              std::filesystem::create_directories(self.getDataDir(), ec);
+              if (ec) {
+                  self.getLogger().error("Failed to create data directory {}: {}", self.getDataDir().string(),
+                                         ec.message());
+                  return false;
+              }
+
+              std::filesystem::create_directories(self.getConfigDir(), ec);
+              if (ec) {
+                  self.getLogger().error("Failed to create config directory {}: {}",
+                                         self.getConfigDir().string(), ec.message());
+                  return false;
+              }
+
+              mConfigFile.emplace();
+              if (!mConfigFile->load()) {
+                  self.getLogger().warn("Failed to load typed config");
+                  return false;
+              }
+              mConfig = mConfigFile->value();
+
+              self.getLogger().info("Loaded {} from {}", self.getName(), self.getModDir().string());
+              return true;
+          }
+
+          bool ClangeMeMod::enable() {
+              auto &self = getSelf();
+              self.getLogger().debug("Enabling...");
+              if (!mConfig.enabled) {
+                  self.getLogger().info("clange_me is disabled by config");
+                  return true;
+              }
+
+              uintptr_t target = resolveAttackTarget();
+              if (target == 0) {
+                  self.getLogger().warn("No attack target configured; set attackSignature or attackRva in config.json. Mod is idle.");
+                  return true;
+              }
+
+              mAttackHook = pl::memory::HookHandle(reinterpret_cast<void *>(target),
+                                                   reinterpret_cast<void *>(&attackDetour),
+                                                   reinterpret_cast<void **>(&mOriginalAttack),
+                                                   pl::memory::HookPriority::Normal);
+              if (!mAttackHook.installed()) {
+                  self.getLogger().error("Failed to install attack hook");
+                  return false;
+              }
+              self.getLogger().info("Attack hook installed");
+              return true;
+          }
+
+          bool ClangeMeMod::disable() {
+              getSelf().getLogger().debug("Disabling...");
+              mAttackHook.reset();
+              return true;
+          }
+
+          bool ClangeMeMod::unload() {
+              getSelf().getLogger().debug("Unloading...");
+              // Release load-time resources here.
+              mConfigFile.reset();
+              return true;
+          }
+
+          } // namespace clange_me
+          SRCEOF
 
       - name: Install NDK and Ninja
         run: |
@@ -74,3 +328,4 @@ jobs:
         with:
           name: better-hitreg
           path: build-*/*.levipack
+          
