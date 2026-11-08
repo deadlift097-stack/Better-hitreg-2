@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "enabled": true,
+  "hitSound": true,
+  "muffleAmount": 0,
+  "sharpenAmount": 0,
+  "attackSignature": "",
+  "attackRva": ""
+}
